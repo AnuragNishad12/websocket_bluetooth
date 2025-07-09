@@ -5,8 +5,6 @@ const path = require('path');
 
 const app = express();
 const server = http.createServer(app);
-
-// Create WebSocket server on top of HTTP server
 const wss = new WebSocket.Server({ server });
 
 // Serve static files (optional client)
@@ -15,6 +13,10 @@ app.use(express.static(path.join(__dirname, 'public')));
 // Store connected clients with roles
 const clients = new Map();
 let masterClient = null;
+
+// Optional: Basic rate limiting config (per master stream)
+const MIN_AUDIO_INTERVAL = 10; // ms
+let lastAudioSentTime = 0;
 
 wss.on('connection', (ws) => {
   console.log('🔗 New client connected');
@@ -28,7 +30,6 @@ wss.on('connection', (ws) => {
 
   ws.on('message', (message) => {
     try {
-      // Try to parse as JSON for control messages
       const data = JSON.parse(message);
 
       if (data.type === 'register') {
@@ -62,7 +63,6 @@ wss.on('connection', (ws) => {
         });
 
       } else if (data.type === 'audio_start') {
-        // Master is starting audio stream
         console.log('🎶 Audio stream starting');
         broadcastToSlaves({
           type: 'audio_start',
@@ -70,7 +70,6 @@ wss.on('connection', (ws) => {
         });
 
       } else if (data.type === 'audio_stop') {
-        // Master is stopping audio stream
         console.log('⏹️ Audio stream stopping');
         broadcastToSlaves({
           type: 'audio_stop',
@@ -78,7 +77,6 @@ wss.on('connection', (ws) => {
         });
 
       } else if (data.type === 'sync') {
-        // Synchronization message
         broadcastToSlaves({
           type: 'sync',
           masterTimestamp: data.timestamp,
@@ -87,31 +85,45 @@ wss.on('connection', (ws) => {
       }
 
     } catch (e) {
-      // If not JSON, treat as binary audio data
+      // Handle non-JSON: likely audio binary data
       if (ws === masterClient) {
+        const now = Date.now();
+
+        // Optional rate limiting
+        if (now - lastAudioSentTime < MIN_AUDIO_INTERVAL) {
+          return;
+        }
+        lastAudioSentTime = now;
+
         console.log(`🎵 Broadcasting audio chunk of size: ${message.length}`);
 
-        // Add timestamp to audio chunk
+        // Metadata
         const audioPacket = {
           type: 'audio_chunk',
-          timestamp: Date.now(),
+          timestamp: now,
           size: message.length
         };
 
-        // Broadcast to all slave clients
+        // Notify slaves about incoming chunk
         broadcastToSlaves(JSON.stringify(audioPacket));
 
-        // Then send the actual audio data
+        // Send audio chunk to all slaves with error handling
         wss.clients.forEach((client) => {
           if (client !== ws && client.readyState === WebSocket.OPEN) {
             const clientInfo = clients.get(client);
             if (clientInfo && clientInfo.role === 'slave') {
-              client.send(message); // Forward the binary audio chunk
+              try {
+                client.send(message); // Send binary
+              } catch (err) {
+                console.error(`❌ Error sending to slave ${clientInfo.id}:`, err);
+                client.close();
+                clients.delete(client);
+              }
             }
           }
         });
       } else {
-        console.log('⚠️ Received audio data from non-master client');
+        console.warn('⚠️ Received audio from non-master client — ignored.');
       }
     }
   });
@@ -124,7 +136,6 @@ wss.on('connection', (ws) => {
       masterClient = null;
       console.log('🎵 Master client disconnected');
 
-      // Notify all slaves that master disconnected
       broadcastToSlaves({
         type: 'master_disconnected',
         timestamp: Date.now()
@@ -133,7 +144,6 @@ wss.on('connection', (ws) => {
 
     clients.delete(ws);
 
-    // Notify remaining clients about disconnection
     broadcastToSlaves({
       type: 'client_update',
       totalClients: clients.size,
@@ -146,21 +156,25 @@ wss.on('connection', (ws) => {
   });
 });
 
-// Helper function to broadcast to all slave clients
+// Broadcast helper
 function broadcastToSlaves(message) {
-  const messageString = typeof message === 'string' ? message : JSON.stringify(message);
+  const messageStr = typeof message === 'string' ? message : JSON.stringify(message);
 
   wss.clients.forEach((client) => {
-    if (client.readyState === WebSocket.OPEN) {
-      const clientInfo = clients.get(client);
-      if (clientInfo && clientInfo.role === 'slave') {
-        client.send(messageString);
+    const clientInfo = clients.get(client);
+    if (client.readyState === WebSocket.OPEN && clientInfo && clientInfo.role === 'slave') {
+      try {
+        client.send(messageStr);
+      } catch (err) {
+        console.error(`❌ Error during broadcast to slave ${clientInfo.id}:`, err);
+        client.close();
+        clients.delete(client);
       }
     }
   });
 }
 
-// Health check endpoint
+// Health check
 app.get('/health', (req, res) => {
   res.json({
     status: 'healthy',
@@ -170,7 +184,7 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Stats endpoint
+// Client stats
 app.get('/stats', (req, res) => {
   const clientStats = Array.from(clients.entries()).map(([ws, info]) => ({
     role: info.role,
@@ -187,7 +201,7 @@ app.get('/stats', (req, res) => {
   });
 });
 
-// Start server
+// Start the server
 const PORT = process.env.PORT || 8080;
 server.listen(PORT, () => {
   console.log(`🚀 Server running at http://localhost:${PORT}`);
