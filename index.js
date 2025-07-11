@@ -1,210 +1,90 @@
 const express = require('express');
-const http = require('http');
-const WebSocket = require('ws');
-const path = require('path');
-
+const multer = require('multer');
+const fs = require('fs');
+const cors = require('cors');
+const { google } = require('googleapis');
 const app = express();
-const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
+const upload = multer({ dest: 'uploads/' });
 
-// Serve static files (optional client)
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(cors());
 
-// Store connected clients with roles
-const clients = new Map();
-let masterClient = null;
+// Load Google Drive credentials
+const CREDENTIALS = JSON.parse(fs.readFileSync('uploads/credentials.json'));
+const { client_id, client_secret, redirect_uris } = CREDENTIALS.web;
 
-// Optional: Basic rate limiting config (per master stream)
-const MIN_AUDIO_INTERVAL = 10; // ms
-let lastAudioSentTime = 0;
 
-wss.on('connection', (ws) => {
-  console.log('🔗 New client connected');
+const oAuth2Client = new google.auth.OAuth2(
+  client_id, client_secret, redirect_uris[0]
+);
 
-  // Send initial connection message
-  ws.send(JSON.stringify({
-    type: 'connection',
-    message: 'Connected to audio streaming server',
-    timestamp: Date.now()
-  }));
+const TOKEN_PATH = 'token.json';
 
-  ws.on('message', (message) => {
-    try {
-      const data = JSON.parse(message);
-
-      if (data.type === 'register') {
-        // Register client as master or slave
-        clients.set(ws, {
-          role: data.role,
-          id: data.id,
-          connectedAt: Date.now()
-        });
-
-        if (data.role === 'master') {
-          masterClient = ws;
-          console.log(`🎵 Master client registered: ${data.id}`);
-        } else {
-          console.log(`🎧 Slave client registered: ${data.id}`);
-        }
-
-        // Send registration confirmation
-        ws.send(JSON.stringify({
-          type: 'registered',
-          role: data.role,
-          connectedClients: clients.size,
-          timestamp: Date.now()
-        }));
-
-        // Notify all clients about new connection
-        broadcastToSlaves({
-          type: 'client_update',
-          totalClients: clients.size,
-          timestamp: Date.now()
-        });
-
-      } else if (data.type === 'audio_start') {
-        console.log('🎶 Audio stream starting');
-        broadcastToSlaves({
-          type: 'audio_start',
-          timestamp: Date.now()
-        });
-
-      } else if (data.type === 'audio_stop') {
-        console.log('⏹️ Audio stream stopping');
-        broadcastToSlaves({
-          type: 'audio_stop',
-          timestamp: Date.now()
-        });
-
-      } else if (data.type === 'sync') {
-        broadcastToSlaves({
-          type: 'sync',
-          masterTimestamp: data.timestamp,
-          serverTimestamp: Date.now()
-        });
-      }
-
-    } catch (e) {
-      // Handle non-JSON: likely audio binary data
-      if (ws === masterClient) {
-        const now = Date.now();
-
-        // Optional rate limiting
-        if (now - lastAudioSentTime < MIN_AUDIO_INTERVAL) {
-          return;
-        }
-        lastAudioSentTime = now;
-
-        console.log(`🎵 Broadcasting audio chunk of size: ${message.length}`);
-
-        // Metadata
-        const audioPacket = {
-          type: 'audio_chunk',
-          timestamp: now,
-          size: message.length
-        };
-
-        // Notify slaves about incoming chunk
-        broadcastToSlaves(JSON.stringify(audioPacket));
-
-        // Send audio chunk to all slaves with error handling
-        wss.clients.forEach((client) => {
-          if (client !== ws && client.readyState === WebSocket.OPEN) {
-            const clientInfo = clients.get(client);
-            if (clientInfo && clientInfo.role === 'slave') {
-              try {
-                client.send(message); // Send binary
-              } catch (err) {
-                console.error(`❌ Error sending to slave ${clientInfo.id}:`, err);
-                client.close();
-                clients.delete(client);
-              }
-            }
-          }
-        });
-      } else {
-        console.warn('⚠️ Received audio from non-master client — ignored.');
-      }
-    }
+// Step 1: Google OAuth flow
+app.get('/auth', (req, res) => {
+  const authUrl = oAuth2Client.generateAuthUrl({
+    access_type: 'offline',
+    scope: ['https://www.googleapis.com/auth/drive.file'],
   });
+  res.redirect(authUrl);
+});
 
-  ws.on('close', () => {
-    console.log('❌ Client disconnected');
+app.get('/oauth2callback', async (req, res) => {
+  const { code } = req.query;
+  const { tokens } = await oAuth2Client.getToken(code);
+  oAuth2Client.setCredentials(tokens);
+  fs.writeFileSync(TOKEN_PATH, JSON.stringify(tokens));
+  res.send('Authentication successful! Token saved.');
+});
 
-    const clientInfo = clients.get(ws);
-    if (clientInfo && clientInfo.role === 'master') {
-      masterClient = null;
-      console.log('🎵 Master client disconnected');
+// Upload APK to Drive
+app.post('/upload', upload.single('apkFile'), async (req, res) => {
+  const token = JSON.parse(fs.readFileSync(TOKEN_PATH));
+  oAuth2Client.setCredentials(token);
 
-      broadcastToSlaves({
-        type: 'master_disconnected',
-        timestamp: Date.now()
-      });
-    }
+  const drive = google.drive({ version: 'v3', auth: oAuth2Client });
+  const fileMetadata = { name: req.file.originalname };
+  const media = {
+    mimeType: req.file.mimetype,
+    body: fs.createReadStream(req.file.path)
+  };
 
-    clients.delete(ws);
-
-    broadcastToSlaves({
-      type: 'client_update',
-      totalClients: clients.size,
-      timestamp: Date.now()
+  try {
+    const response = await drive.files.create({
+      resource: fileMetadata,
+      media: media,
+      fields: 'id, webViewLink, webContentLink',
     });
-  });
 
-  ws.on('error', (error) => {
-    console.error('WebSocket error:', error);
-  });
+    res.json({
+      message: 'File uploaded successfully!',
+      file: response.data
+    });
+  } catch (err) {
+    console.error('Upload Error:', err);
+    res.status(500).send('Upload failed');
+  }
 });
 
-// Broadcast helper
-function broadcastToSlaves(message) {
-  const messageStr = typeof message === 'string' ? message : JSON.stringify(message);
+// List all APKs from Drive
+app.get('/list-apks', async (req, res) => {
+  const token = JSON.parse(fs.readFileSync(TOKEN_PATH));
+  oAuth2Client.setCredentials(token);
 
-  wss.clients.forEach((client) => {
-    const clientInfo = clients.get(client);
-    if (client.readyState === WebSocket.OPEN && clientInfo && clientInfo.role === 'slave') {
-      try {
-        client.send(messageStr);
-      } catch (err) {
-        console.error(`❌ Error during broadcast to slave ${clientInfo.id}:`, err);
-        client.close();
-        clients.delete(client);
-      }
-    }
-  });
-}
+  const drive = google.drive({ version: 'v3', auth: oAuth2Client });
 
-// Health check
-app.get('/health', (req, res) => {
-  res.json({
-    status: 'healthy',
-    connectedClients: clients.size,
-    masterConnected: masterClient !== null,
-    uptime: process.uptime()
-  });
+  try {
+    const result = await drive.files.list({
+      q: "name contains '.apk'",
+      fields: 'files(id, name, webViewLink, webContentLink)',
+    });
+
+    res.json(result.data.files);
+  } catch (err) {
+    console.error('List Error:', err);
+    res.status(500).send('Failed to list APKs');
+  }
 });
 
-// Client stats
-app.get('/stats', (req, res) => {
-  const clientStats = Array.from(clients.entries()).map(([ws, info]) => ({
-    role: info.role,
-    id: info.id,
-    connectedAt: info.connectedAt,
-    connected: ws.readyState === WebSocket.OPEN
-  }));
-
-  res.json({
-    totalClients: clients.size,
-    masterConnected: masterClient !== null,
-    clients: clientStats,
-    uptime: process.uptime()
-  });
-});
-
-// Start the server
-const PORT = process.env.PORT || 8080;
-server.listen(PORT, () => {
-  console.log(`🚀 Server running at http://localhost:${PORT}`);
-  console.log(`📊 Health check: http://localhost:${PORT}/health`);
-  console.log(`📈 Stats: http://localhost:${PORT}/stats`);
+app.listen(3000, () => {
+  console.log('API running on port 3000');
 });
